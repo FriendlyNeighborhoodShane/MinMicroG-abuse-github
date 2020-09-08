@@ -1,0 +1,193 @@
+#!/bin/awk -f
+# create release message for MMG-CI releases
+# feeds on git diff --raw
+
+BEGIN {
+
+  # map uncommon apk names to conventional names for translation
+  delete appmap
+  appmap["GoogleBackupTransport"]     = "Google sync adapters"
+  appmap["GoogleCalendarSyncAdapter"] = "Google sync adapters"
+  appmap["GoogleContactsSyncAdapter"] = "Google sync adapters"
+  appmap["MicroGDroidGuard"]          = "Droidguard"
+  appmap["MicroGGMSCore"]             = "MicroG"
+  appmap["MicroGGSFProxy"]            = "GSF proxy"
+  appmap["MicroGUNLP"]                = "UNLP"
+  appmap["PatchPhonesky"]             = "Patched Playstore"
+
+  # init stateful vars
+  # arrays and index counters
+  appc = 0
+  binc = 0
+  cerc = 0
+  delete appv
+  delete binv
+  delete cerv
+
+}
+
+# git diff --raw format
+# (p = number of parents of commit)
+# (SP = space char)
+# { ":" }*p { mode SP }*(p+1) { hash SP }*(p+1) status SP { filepath SP }*?
+# 0..p modes and hashes are of parents, (p+1)ths are of the child
+# IDK anything about filepaths
+#
+# example:
+# :000000 100644 0000000 3abb859 A README.md
+# ::100644 100644 100644 08576ac 08576ac c4585d8 MM system/bin/npem
+
+# skip non-diff lines
+# they don't start with colons
+!/^:[:]*/ { next }
+
+# process each line and take out useful fields
+# set variables: file, action
+{
+
+  # match the pattern and get number of colons
+  # number of colons = number of parents of commit
+  match($0, "^:[:]*")
+  parents = RLENGTH
+  offset = (parents + 1) * 2
+
+  # get change status and build array of filepaths
+  change = $(offset + 1)
+  filec = 0
+  delete filev
+  for (i = offset + 2; i <= NF; i++) {
+    filev[filec] = $i
+    filec += 1
+  }
+
+  # I have no idea what to with merges
+  # only supports non-merge commits for now
+  if (parents != 1) next
+  if (change ~ "C" || change ~ "R")
+    # for copies and renames, first filepath is src, second is dst
+    file = filev[1]
+  else
+    # for everything else there is only one filepath
+    file = filev[0]
+
+  # find action by matching status code
+  if (change ~ "A" || change ~ "C" || change ~ "R")
+    action = "added"
+  else if (change ~ "M")
+    action = "updated"
+  else if (change ~ "D")
+    action = "deleted"
+  else
+    # unknown status, skip
+    next
+
+}
+
+# match file with various paths
+# add their string and action to relevant arrays
+# array[i, 0] = string
+# array[i, 1] = action
+
+# string literals used as regex patterns are parsed twice by awk
+# all escapes need to be doubled for simpler implementations
+
+file ~ "^system/(priv-)?app/[^/]*/(-[^/]*-/)?[^/]*\\.apk$" {
+  split(file, arr, "/")
+  str = arr[3]
+  if (str in appmap)
+    str = appmap[str]
+  for (i = 0; i < appc; i++)
+    if (appv[i, 0] == str) next
+  appv[appc, 0] = str
+  appv[appc, 1] = action
+  appc += 1
+  next
+}
+file ~ "^system/(x)?bin/(-[^/]*-/)?[^/]*$" {
+  n = split(file, arr, "/")
+  str = "`" arr[n] "`"
+  for (i = 0; i < binc; i++)
+    if (binv[i, 0] == str) next
+  binv[binc, 0] = str
+  binv[binc, 1] = action
+  binc += 1
+  next
+}
+file ~ "^system/framework/(-[^/]*-/)?com\\.google\\.android\\.maps\\.jar$" {
+  str = "MicroG maps API v1"
+  for (i = 0; i < binc; i++)
+    if (binv[i, 0] == str) next
+  binv[binc, 0] = str
+  binv[binc, 1] = "updated"
+  binc += 1
+  next
+}
+file ~ "^system/framework/(-[^/]*-/)?com\\.google\\.(android\\.media\\.effects|widevine\\.software\\.drm)\\.jar$" {
+  str = "Google DRM libraries"
+  for (i = 0; i < binc; i++)
+    if (binv[i, 0] == str) next
+  binv[binc, 0] = str
+  binv[binc, 1] = "updated"
+  binc += 1
+  next
+}
+file ~ "^system/lib(64)?/(-[^/]*-/)?libjni_(keyboarddecoder|latinimegoogle)\\.so$" {
+  str = "Google keyboard swype libraries"
+  for (i = 0; i < binc; i++)
+    if (binv[i, 0] == str) next
+  binv[binc, 0] = str
+  binv[binc, 1] = "updated"
+  binc += 1
+  next
+}
+file ~ "^util/certs/repo/[^/]*\\.cer$" {
+  split(file, arr, "/")
+  repo = substr(arr[4], 1, length(arr[4]) - length(".cer"))
+  str = "cert for repo" " " repo
+  for (i = 0; i < cerc; i++)
+    if (cerv[i, 0] == str) next
+  cerv[cerc, 0] = str
+  cerv[cerc, 1] = "changed"
+  cerc += 1
+  next
+}
+file ~ "^util/certs/system/(priv-)?app/[^/]*/(-[^/]*-/)?[^/]*\\.cer$" {
+  split(file, arr, "/")
+  str = "cert for app" " " arr[5]
+  for (i = 0; i < cerc; i++)
+    if (cerv[i, 0] == str) next
+  cerv[cerc, 0] = str
+  cerv[cerc, 1] = "changed"
+  cerc += 1
+  next
+}
+
+END {
+
+  # printf fmt string
+  fmt = "  - %s %s\n"
+
+  # loop through all non-empty lists and print elements
+  if (appc) {
+    print("- Apps changed:")
+    for (i = 0; i < appc; i++) {
+      printf(fmt, appv[i, 1], appv[i, 0])
+    }
+    print("")
+  }
+  if (binc) {
+    print("- Binaries changed:")
+    for (i = 0; i < binc; i++) {
+      printf(fmt, binv[i, 1], binv[i, 0])
+    }
+    print("")
+  }
+  if (cerc) {
+    print("- Certs changed:")
+    for (i = 0; i < cerc; i++) {
+      printf(fmt, cerv[i, 1], cerv[i, 0])
+    }
+    print("")
+  }
+
+}

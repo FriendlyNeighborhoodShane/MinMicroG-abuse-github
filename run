@@ -1,0 +1,202 @@
+#!/bin/sh
+# Build and upload MinMicroG packages
+
+error() {
+  echo " ";
+  echo "!!! FATAL: $1";
+  exit 1;
+}
+
+# Use sudo if available
+exec_su() {
+  if false; then
+    return 1;
+  elif command -v "sudo" >/dev/null; then
+    sudo "$@";
+  else
+    "$@";
+  fi;
+}
+
+# Translate command names to package names
+getpkg() {
+  case "$1" in
+    *)
+      echo "$1"
+    ;;
+  esac;
+}
+
+# Find package manager
+if false; then
+  :;
+elif command -v "apt-get" >/dev/null; then
+  echo 'debconf debconf/frontend select Noninteractive' | exec_su debconf-set-selections;
+  exec_su apt-get update -yy;
+  exec_su apt-get upgrade -yy;
+  pmcmd() {
+    pkg="$(getpkg "$1")";
+    exec_su apt-get install -yy "$pkg";
+  }
+else
+  echo " ";
+  echo "!!! ERROR: Could not figure out package manager";
+  pmcmd() {
+    return 1;
+  }
+fi;
+
+# Dependency check
+for bin in curl git jq unzip zip; do
+  command -v "$bin" >/dev/null || pmcmd "$bin";
+  command -v "$bin" >/dev/null || error "could not install dependency: $bin";
+done;
+for bin in aapt apksigner openssl; do
+  command -v "$bin" >/dev/null || pmcmd "$bin";
+  command -v "$bin" >/dev/null || {
+    echo " ";
+    echo "!!! ERROR: Could not install optional dependency: $bin !!!";
+  }
+done;
+
+# Variables
+tag="$(date -u +"%Y.%m.%d")";
+name="$(date -u +"%d %b %Y")";
+date="$(date -u +"%Y%m%d%H%M%S")";
+
+# Clone time
+echo " ";
+echo "Cloning MinMicroG...";
+git clone "https://github.com/FriendlyNeighborhoodShane/MinMicroG";
+git clone "https://github.com/FriendlyNeighborhoodShane/MinMicroG-abuse-CI" "MinMicroG-resdl";
+(
+  cd "./MinMicroG-resdl";
+  git fetch origin "refs/volatile/current:current";
+  git checkout "current";
+  git reset;
+)
+
+# Intro
+mkdir "./MinMicroG/releases";
+echo " ";
+{
+  echo " --- MinMicroG autobuild logs --- ";
+  echo " ";
+  echo "Date: $name $date";
+  echo "System: $(uname -a)";
+} | tee "./MinMicroG/releases/build-$date.log";
+
+# Setup stuff
+echo " ";
+echo "Setting up build...";
+ln -frs "./MinMicroG-resdl/system" "./MinMicroG-resdl/util" "./MinMicroG/resdl/";
+cert="$(curl -fs "https://api.github.com/repos/FriendlyNeighborhoodShane/MinMicroG_releases/releases" | jq -r ".[].assets[].browser_download_url" | grep "certs.tar.gz$" | head -n1)";
+[ "$cert" ] && {
+  {
+    echo " ";
+    echo "Cert archive found at $cert"
+  } | tee -a "./MinMicroG/releases/build-$date.log";
+  (
+    cd "./MinMicroG-resdl/util/certs" || error "could not cd";
+    rm -rf ./*;
+    curl -fL "$cert" | tar xz;
+  )
+}
+
+# Build time
+echo " ";
+echo "Updating and building MinMicroG...";
+(
+  echo " ";
+  cd "./MinMicroG" || error "could not cd";
+  ./bump.sh "UPDATELY" "999999" "$name";
+  ./update.sh;
+  ./build.sh all;
+) 2>&1 | tee -a "./MinMicroG/releases/build-$date.log";
+
+# Create diff
+echo " ";
+echo "Generating update diff...";
+echo " ";
+(
+  cd "./MinMicroG-resdl" || error "could not cd";
+  git add -A;
+  echo "Update diff from last CI build:";
+  echo " ";
+  git diff -C -C --stat --patch --staged;
+  echo " ";
+  echo "Update diff from last official build:";
+  echo " ";
+  git diff -C -C --stat --patch --staged "HEAD^";
+) | tee "./MinMicroG/releases/diff-$date.txt";
+
+# Exit if not running on Github CI
+[ "$GITHUB_TOKEN" ] || exit 0;
+
+# Release variables
+auth="Authorization: token $GITHUB_TOKEN";
+ghapi="https://api.github.com/repos/$GITHUB_REPOSITORY/releases";
+ghupl="https://uploads.github.com/repos/$GITHUB_REPOSITORY/releases";
+id="$(curl -fs -H "$auth" "$ghapi/tags/$tag" | jq -r '.id')";
+
+# Big if true
+if [ "$id" != "null" ] && [ "$id" != "" ]; then
+  echo " ";
+  echo "Daily release $tag exists !!!";
+  exit 0;
+elif (cd "./MinMicroG-resdl" && [ "$(git diff --staged -- system)" ]); then
+  echo " ";
+  echo "Committing updates to resdl tracker...";
+  (
+    cd "./MinMicroG-resdl" || error "could not cd";
+    git -c user.name="github-actions" -c user.email="actions@github.com" commit --amend -m "Current bins";
+    git push -f "https://$GITHUB_ACTOR:$GITHUB_TOKEN@github.com/$GITHUB_REPOSITORY" "+HEAD:refs/volatile/current";
+  )
+elif [ "$GITHUB_EVENT_NAME" != "workflow_dispatch" ]; then
+  echo " ";
+  echo "Nothing to update !!!";
+  exit 0;
+fi;
+
+# Release time
+echo " ";
+echo "Creating release at $tag...";
+commit="$(git -C "./MinMicroG-resdl" rev-parse "HEAD")";
+[ "$commit" ] || error "could not get resdl commit";
+str="$(cat <<EOF | jq -Rsr "@json";
+Automatic release triggered by $GITHUB_EVENT_NAME.
+The masses deserve to be lazy!
+
+Update diff from last CI build:
+
+$( (cd "./MinMicroG-resdl" && git diff --raw "HEAD@{1}";) | "./diffmsg" | sed 's|^|  |g'; )
+
+Update diff from last official release:
+
+$( (cd "./MinMicroG-resdl" && git diff --raw "HEAD^";)    | "./diffmsg" | sed 's|^|  |g'; )
+EOF
+)";
+cat <<EOF | curl --data "@-" -H "$auth" -H "Content-Type: application/json" "$ghapi";
+{
+  "tag_name": "$tag",
+  "target_commitish": "$commit",
+  "name": "$name",
+  "body": $str,
+  "draft": true
+}
+EOF
+id="$(curl -fs -H "$auth" "$ghapi" | jq -r --arg tag "$tag" '. | sort_by(.created_at) | .[] | select(.tag_name == $tag and .draft == true) | .id' | tail -n1)";
+[ "$id" ] && [ "$id" != "null" ] || error "could not find release id";
+
+# Upload time
+echo " ";
+echo "Uploading files...";
+for file in "./MinMicroG/releases"/*; do
+  ghass="$ghupl/$id/assets?name=$(basename "$file")";
+  curl --data-binary @"$file" -H "$auth" -H "Content-Type: application/octet-stream" "$ghass" -o /dev/null;
+done;
+
+# Publish drafted release
+cat <<EOF | curl --data "@-" -H "$auth" -H "Content-Type: application/json" "$ghapi/$id";
+{"draft":false}
+EOF
